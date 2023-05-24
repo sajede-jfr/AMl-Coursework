@@ -1,0 +1,258 @@
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.optim import lr_scheduler
+import torchvision
+from torchvision.utils import make_grid
+from torchvision import datasets, models, transforms
+from torch.utils.data import random_split, DataLoader
+import os
+import numpy as np
+from sklearn.model_selection import train_test_split
+from torch.utils.data import Subset
+from torch.utils.tensorboard import SummaryWriter
+from sklearn.metrics import confusion_matrix
+from tensorboard.backend.event_processing import event_accumulator
+import matplotlib.pyplot as plt
+from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
+
+
+
+from torchvision.transforms import RandomHorizontalFlip, RandomRotation, RandomResizedCrop
+
+
+# Create the SummaryWriter
+import shutil
+
+shutil.rmtree('runs')
+
+writer = SummaryWriter('runs/experiment_1')
+
+
+# Define a transformation for training data with augmentation
+train_transform = transforms.Compose([
+    transforms.Resize((224, 224)),
+    RandomHorizontalFlip(),  # Randomly flip the image horizontally
+    RandomRotation(20),  # Randomly rotate the image within a range of (-20, 20)
+    RandomResizedCrop(224, scale=(0.8, 1.0)),  # Randomly scale and crop the image
+    transforms.ToTensor()
+])
+
+
+
+# Define a transformation for validation data without augmentation
+validation_transform = transforms.Compose([
+    transforms.Resize((224, 224)),
+    transforms.ToTensor()
+])
+
+# Load the datasets
+dataset = datasets.ImageFolder('/content/AMLproject/Places2_simp')
+
+dataset_size = len(dataset)
+train_size = int(0.8 * dataset_size)
+validation_size = dataset_size - train_size
+# Split the dataset into training set and validation set
+train_dataset, validation_dataset = random_split(dataset, [train_size, validation_size])
+
+# Apply the transformations to the datasets
+train_dataset.dataset.transform = train_transform
+validation_dataset.dataset.transform = validation_transform
+
+# Create dataloaders
+train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True)
+validation_loader = DataLoader(validation_dataset, batch_size=64, shuffle=True)
+
+
+# Load pre-trained ResNet-34
+model = models.resnet34(pretrained=True)
+
+# Freeze all layers in the model. This retains the pre-trained features
+for param in model.parameters():
+    param.requires_grad = False
+
+# Get the number of features in the last layer
+num_ftrs = model.fc.in_features
+
+# Replace the last layer with a new layer that matches the number of classes in our dataset
+Class_name = dataset.classes
+num_classes = len(dataset.classes)
+model.fc = torch.nn.Linear(num_ftrs, num_classes)
+
+# Print the model to verify
+print(model)
+
+
+# Define the loss function
+criterion = torch.nn.CrossEntropyLoss()
+
+# Define the optimizer, learning rate of 0.001
+optimizer = torch.optim.Adam(model.fc.parameters(), lr=0.001)
+
+# Define the number of epochs to train for
+num_epochs = 2
+
+
+# Define the optimizer, learning rate of 0.0001 for the base layers and 0.01 for the last layer
+#base_params = list(model.parameters())[:-2]  # parameters of the base layers
+#last_layer_params = list(model.parameters())[-2:]  # parameters of the last layer
+#optimizer = torch.optim.Adam([
+ #   {'params': base_params},
+  #  {'params': last_layer_params, 'lr': 0.0003}
+#], lr=0.0001)
+
+# Define the loss function
+criterion = torch.nn.CrossEntropyLoss()
+
+
+# Move the model to the GPU if available
+device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+model = model.to(device)
+
+# Training loop
+for epoch in range(num_epochs):
+
+    print('Epoch {}/{}'.format(epoch, num_epochs - 1))
+
+    # Each epoch has a training and validation phase
+    for phase in ['train', 'validation']:
+        if phase == 'train':
+            model.train()  # Set model to training mode
+            dataloader = train_loader
+        else:
+            model.eval()   # Set model to evaluate mode
+            dataloader = validation_loader
+
+        running_loss = 0.0
+        running_corrects = 0
+
+        # Iterate over the data
+        for i, (inputs, labels) in enumerate(dataloader):
+            inputs = inputs.to(device)
+            labels = labels.to(device)
+
+            # Forward pass
+            with torch.set_grad_enabled(phase == 'train'):
+                outputs = model(inputs)
+                _, preds = torch.max(outputs, 1)
+                loss = criterion(outputs, labels)
+
+                # Backward pass and optimize only if in training phase
+                if phase == 'train':
+                    optimizer.zero_grad()
+                    loss.backward()
+                    optimizer.step()
+
+            # Statistics
+            running_loss += loss.item() * inputs.size(0)
+            running_corrects += torch.sum(preds == labels.data)
+
+            if i % 100 == 0:
+                writer.add_scalar(f'{phase} loss', running_loss / ((i+1)*inputs.size(0)), epoch * len(dataloader) + i)
+
+        epoch_loss = running_loss / len(dataloader.dataset)
+        epoch_acc = running_corrects.double() / len(dataloader.dataset)
+
+        writer.add_scalar(f'{phase} epoch loss', epoch_loss, epoch)
+        writer.add_scalar(f'{phase} epoch accuracy', epoch_acc, epoch)
+
+        print('{} Loss: {:.4f} Acc: {:.4f}'.format(phase, epoch_loss, epoch_acc))
+
+# After loops, close the writer
+writer.close()
+
+from sklearn.metrics import confusion_matrix
+import numpy as np
+
+def accuracy(output, target, topk=(1,)):
+    """Computes the accuracy over the k top predictions for the specified values of k"""
+    with torch.no_grad():
+        maxk = max(topk)
+        batch_size = target.size(0)
+
+        _, pred = output.topk(maxk, 1, True, True)
+        pred = pred.t()
+        correct = pred.eq(target.view(1, -1).expand_as(pred))
+
+        res = []
+        for k in topk:
+            correct_k = correct[:k].reshape(-1).float().sum(0, keepdim=True)
+            res.append(correct_k.mul_(100.0 / batch_size).item())
+        return res
+
+# Define device
+device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+
+# Switch model to evaluation mode
+model.eval()
+
+# Lists for results
+y_true = []
+y_pred = []
+
+# Iterate over validation data
+for inputs, labels in validation_loader:
+    inputs = inputs.to(device)
+    labels = labels.to(device)
+
+    # Forward pass
+    outputs = model(inputs)
+    _, preds = torch.max(outputs, 1)
+
+    y_true.extend(labels.cpu().numpy())
+    y_pred.extend(preds.cpu().numpy())
+
+# Compute accuracy
+top1, top5 = accuracy(torch.tensor(outputs), torch.tensor(labels), topk=(1, 5))
+print(f'Top-1 accuracy: {top1:.2f}%')
+print(f'Top-5 accuracy: {top5:.2f}%')
+
+# Compute confusion matrix
+cm = confusion_matrix(y_true, y_pred)
+print('Confusion matrix:')
+print(cm)
+
+
+import matplotlib.pyplot as plt
+
+def imshow(inp, title=None):
+    """Imshow for Tensor."""
+    inp = inp.numpy().transpose((1, 2, 0))
+    mean = np.array([0.485, 0.456, 0.406])
+    std = np.array([0.229, 0.224, 0.225])
+    inp = std * inp + mean
+    inp = np.clip(inp, 0, 1)
+    plt.imshow(inp)
+    if title is not None:
+        plt.title(title)
+    plt.pause(0.001)  
+
+# Get a batch of validation data
+inputs, classes = next(iter(validation_loader))
+
+# Make a grid from batch
+out = torchvision.utils.make_grid(inputs)
+Class_names = dataset.classes
+imshow(out, title=[Class_names[x] for x in classes])
+
+# Move the inputs to the GPU if available 
+inputs = inputs.to(device)
+classes = classes.to(device)
+
+# Forward pass
+outputs = model(inputs)
+_, preds = torch.max(outputs, 1)
+
+# Get the top 5 predictions
+_, top5_preds = outputs.topk(5, 1, True, True)
+
+# Convert predictions to cpu for displaying
+preds = preds.cpu().numpy()
+top5_preds = top5_preds.cpu().numpy()
+
+for i in range(len(inputs)):
+    print(f'Image {i+1}:')
+    print('Actual class: ', Class_names[classes[i]])
+    print('Predicted class: ', Class_names[preds[i]])
+    print('Top 5 predicted classes: ', [Class_names[top5_preds[i][j]] for j in range(len(top5_preds[i]))])
+    print()
